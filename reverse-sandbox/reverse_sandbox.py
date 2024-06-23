@@ -15,13 +15,16 @@ import struct
 import logging.config
 import argparse
 import os
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import IO, Self, Type, Generator
+
 import operation_node
 import sandbox_filter
 import sandbox_regex
 import subprocess
+from abc import ABC, abstractmethod
 from filters import Filters
-
-import tqdm
 
 REGEX_TABLE_OFFSET = 2
 REGEX_COUNT_OFFSET = 4
@@ -32,40 +35,130 @@ NUM_PROFILES_OFFSET = 10
 logging.config.fileConfig("logger.config")
 logger = logging.getLogger(__name__)
 
-ios16_5_struct = struct.Struct('<HHBBBxHHH')
-PROFILE_OPS_OFFSET = 4
 OPERATION_NODE_SIZE = 8
 INDEX_SIZE = 2
 
-class SandboxData():
-    def __init__(self,
-        ios16_struct_size, header, op_nodes_count, sb_ops_count, vars_count, states_count, num_profiles, regex_count, entitlements_count, instructions_count) -> None:
 
-        self.data_file = None
+class ProfileType(IntEnum):
+    NORMAL = 0
+    PROFILE_BUNDLE = 0x8000
 
-        self.header_size = ios16_struct_size
-        self.type = header
-        self.op_nodes_count = op_nodes_count
-        self.sb_ops_count = sb_ops_count
-        self.vars_count = vars_count
-        self.states_count = states_count
-        self.num_profiles = num_profiles
-        self.regex_count = regex_count
-        self.entitlements_count = entitlements_count
 
-        # offsets
-        self.regex_table_offset = self.header_size
-        self.vars_offset = self.regex_table_offset + (self.regex_count * INDEX_SIZE)
-        self.states_offset = self.vars_offset + (self.vars_count * INDEX_SIZE)
-        self.entitlements_offset = self.states_offset + (self.states_count * INDEX_SIZE)
+@dataclass
+class SandboxHeader:
+    profile_type: ProfileType
+    op_nodes_count: int
+    sb_ops_count: int
+    vars_count: int
+    states_count: int
 
-        self.profiles_offset = self.entitlements_offset + (self.entitlements_count * INDEX_SIZE)
-        self.profiles_end_offset = self.profiles_offset + (self.num_profiles * (self.sb_ops_count * INDEX_SIZE + PROFILE_OPS_OFFSET))
-        self.operation_nodes_size = self.op_nodes_count * OPERATION_NODE_SIZE
+
+@dataclass
+class SandboxHeader16_5(SandboxHeader):
+    num_profiles: int
+    regex_count: int
+    entitlements_count: int
+
+
+@dataclass
+class SandboxHeader18_0(SandboxHeader):
+    profile_flags: int
+    num_profiles: int
+    regex_count: int
+    entitlements_count: int
+
+
+class SandboxData(ABC):
+    def __init__(self, args: argparse.Namespace, sb_ops: list[str]):
+        self._args = args
+        self._keep_builtin_filters: bool = args.keep_builtin_filters
+        self._profiles_to_reverse: list[str] | None = args.profiles_to_reverse
+        self._c_output: bool = args.c_output
+        self._macho: bool = args.macho
+        self._output_directory: str = args.output_directory
+        self.data_file: IO = args.input_file
+
+        # Header
+        self._sandbox_header: SandboxHeader | None = None
+        self._header_size: int = self.HEADER_STRUCT.size
+
+        # Offsets
+        self.regex_table_offset: int = 0
+        self.vars_offset: int = 0
+        self.states_offset: int = 0
+        self.entitlements_offset: int = 0
+        self.profiles_offset: int = 0
+        self.profiles_end_offset: int = 0
+        self.operation_nodes_size: int = 0
+        self.operation_nodes_offset: int = 0
+        self.base_addr: int = 0
+
+        # Parse data structures
+        self.regex_list: list = []  # TODO: list of what..?
+        self.global_vars: list[str] = []
+        self.policies: list = []  # TODO: list of what..?
+        self.sb_ops: list[str] = sb_ops  # The list of sandbox operations was already read in parse_args method earlier
+        self.operation_nodes: list[operation_node.OperationNode] = []
+        self.ops_to_reverse: list[str] = args.ops_to_reverse
+
+        # Step1: Parse the sandbox header according to the iOS version
+        self.sandbox_header = self._parse_header()
+        assert self.sandbox_header, 'Sandbox header parsing failed..'
+
+        # Step2: Set offsets accordingly
+        self._parse_offsets()
+
+    @property
+    @abstractmethod
+    def HEADER_STRUCT(self) -> struct.Struct:
+        """
+        The sandbox header structure may differ between iOS versions so this is an abstract property
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def HEADER_CLS(self) -> Type[SandboxHeader]:
+        """
+        The sandbox header structure may differ between iOS versions so this is an abstract property
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def PROFILE_SIZE(self) -> int:
+        """
+        The sandbox profile size may differ between iOS versions so this is an abstract property
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def PROFILE_OPS_OFFSET(self) -> int:
+        """
+        The sandbox profile op_table offset may differ between iOS versions so this is an abstract property
+        """
+        pass
+
+    def _parse_offsets(self):
+        """
+        TODO: Actually now this is not an abstract method.. should it be?
+        The structure of the packed profile bundle may also differ between iOS versions therefore this function is
+        abstract and the implementation should be provided by subclasses
+        """
+        self.sandbox_header: SandboxHeader16_5
+        self.regex_table_offset = self._header_size
+        self.vars_offset = self.regex_table_offset + (self.sandbox_header.regex_count * INDEX_SIZE)
+        self.states_offset = self.vars_offset + (self.sandbox_header.vars_count * INDEX_SIZE)
+        self.entitlements_offset = self.states_offset + (self.sandbox_header.states_count * INDEX_SIZE)
+
+        self.profiles_offset = self.entitlements_offset + (self.sandbox_header.entitlements_count * INDEX_SIZE)
+        self.profiles_end_offset = self.profiles_offset + (self.sandbox_header.num_profiles * self.PROFILE_SIZE)
+        self.operation_nodes_size = self.sandbox_header.op_nodes_count * OPERATION_NODE_SIZE
         self.operation_nodes_offset = self.profiles_end_offset
 
-        if not self.type:
-            self.operation_nodes_offset += self.sb_ops_count * INDEX_SIZE
+        if not self.is_profile_bundle():
+            self.operation_nodes_offset += self.sandbox_header.sb_ops_count * INDEX_SIZE
 
         align_delta = self.operation_nodes_offset & 7
         if align_delta != 0:
@@ -73,36 +166,242 @@ class SandboxData():
 
         self.base_addr = self.operation_nodes_offset + self.operation_nodes_size
 
-        # data
-        self.regex_list = None
-        self.global_vars = None
-        self.policies = None
-        self.sb_ops = None
-        self.operation_nodes = None
-        self.ops_to_reverse = None
+    def _parse_header(self) -> SandboxHeader:
+        """
+        The header format varies between different iOS versions this is a generic method that unpacks the version
+        specific struct and builds a SandboxHeader object to represent the data nicely
+        """
+        self.data_file.seek(0)
+        header_data = self.data_file.read(self.HEADER_STRUCT.size)
+        header_vars = self.HEADER_STRUCT.unpack(header_data)
+        return self.HEADER_CLS(*header_vars)
+
+    def is_profile_bundle(self) -> bool:
+        return self.sandbox_header.profile_type == ProfileType.PROFILE_BUNDLE
+
+    def goto(self, offset: int, relative: bool = False):
+        """
+        Set the data file offset (a global offset from the beginning of the stream)
+        """
+        if relative:
+            offset = offset * 8 + self.base_addr
+        self.data_file.seek(offset)
+
+    def read_short(self, offset: int, relative: bool = False) -> int:
+        self.goto(offset, relative)
+        return int.from_bytes(self.data_file.read(2), 'little')
+
+    def read_string(self, string_offset: int) -> str:
+        """
+        Extract string (literal) from given string offset.
+        [len][string]
+        """
+        string_length = self.read_short(string_offset, relative=True) - 1
+
+        # TODO: are the strings really encoded using utf-8..?
+        return self.data_file.read(string_length).decode('utf-8')
+
+    def read_binary(self, binary_offset: int) -> tuple[int, ...]:
+        binary_length = self.read_short(binary_offset, relative=True)
+        return struct.unpack(f'{binary_length}B', self.data_file.read(binary_length))
+
+    def read_op_table(self, op_table_offset: int) -> tuple[int, ...]:
+        self.goto(op_table_offset)
+        data = self.data_file.read(INDEX_SIZE * self.sandbox_header.sb_ops_count)
+        return struct.unpack(f'<{self.sandbox_header.sb_ops_count}H', data)
+
+    def parse_common(self):
+        self._parse_regex_list()
+        self._parse_global_vars()
+        self._parse_policies()
+        self._parse_operation_nodes()
+
+    def _parse_regex_list(self) -> None:
+        count = self.sandbox_header.regex_count
+        if not count:
+            logger.info("Sandbox profile does not contain any regexes, skipping  parsing..")
+            return
+
+        logger.info(f'Parsing {count} regular expressions at offset {self.regex_table_offset:#x}')
+
+        self.goto(self.regex_table_offset)
+        data = self.data_file.read(INDEX_SIZE * count)
+
+        for regex_offset in struct.iter_unpack('<H', data):
+            regex_offset, = regex_offset  # Unpack tuple..
+            re = self.read_binary(regex_offset)
+            logging.debug(f'Current regex relative offset: {regex_offset:#x} len:{len(re)}')
+            re_debug_str = "re: [", ", ".join([hex(i) for i in re]), "]"
+            logger.debug(re_debug_str)
+            self.regex_list.append(sandbox_regex.parse_regex(re))
+        logger.debug(self.regex_list)
+
+    def _parse_global_vars(self) -> None:
+        count = self.sandbox_header.vars_count
+        if not count:
+            logger.info("Sandbox profile does not contain any global vars, skipping parsing..")
+            return
+
+        logger.info(f"Parsing {count} global vars at offset {self.vars_offset:#x}")
+
+        self.goto(self.vars_offset)
+        data = self.data_file.read(INDEX_SIZE * count)
+        for var_offset in struct.iter_unpack('<H', data):
+            var_offset, = var_offset  # Unpack tuple..
+            var_name = self.read_string(var_offset)
+            self.global_vars.append(var_name)
+
+        logger.info("global variables are {:s}".format(", ".join(s for s in self.global_vars)))
+
+    def _parse_policies(self) -> None:
+        count = self.sandbox_header.entitlements_count
+        if not count:
+            logger.info("Sandbox profile does not contain any policies (entitlements..?), skipping parsing..")
+            return
+
+        # TODO: why is the offset called entitlements but we store them in a member called policies..?
+        self.goto(self.entitlements_offset)
+        self.policies = struct.unpack(f"<{count}H", self.data_file.read(INDEX_SIZE * count))
+
+    def _parse_operation_nodes(self):
+        count = self.sandbox_header.op_nodes_count
+        assert count, 'No sandbox operation nodes'
+        logger.info(f"Parsing {count} operation nodes at offset:{self.operation_nodes_offset:#x}")
+
+        # Place file pointer to start of operation nodes area.
+        self.goto(self.operation_nodes_offset)
+
+        # Read sandbox operations.
+        self.operation_nodes = operation_node.build_operation_nodes(self.data_file, count)
+
+        for op_node in self.operation_nodes:
+            op_node.convert_filter(sandbox_filter.convert_filter_callback, self.data_file, self, self._keep_builtin_filters)
+        logger.info("operation nodes after filter conversion")
+
+    def profiles(self) -> Generator[tuple[int, str], None, None]:
+        for i in range(self.sandbox_header.num_profiles):
+            profile_offset = self.profiles_offset + self.PROFILE_SIZE * i
+            name_offset = self.read_short(profile_offset)
+            yield profile_offset, self.read_string(name_offset)
+
+    def print_sandbox_profiles(self) -> None:
+        assert (self.is_profile_bundle())
+        logger.info(f"Printing {self.sandbox_header.num_profiles} sandbox profiles from bundle")
+
+        for profile_offset, profile_name in self.profiles():
+            logger.info(f'Profile name:{profile_name}')
+
+    def decompile(self):
+        if self.is_profile_bundle():
+            self._decompile_bundle()
+        else:
+            self._decompile_normal()
+
+    def _decompile_bundle(self):
+        logger.info("Input file is a profile bundle.. parsing accordingly")
+
+        # read profiles
+        for profile_offset, profile_name in self.profiles():
+
+            # Go past profiles not in list, in case list is defined.
+            if self._profiles_to_reverse and profile_name not in self._profiles_to_reverse:
+                continue
+
+            logger.info(f"Decompiling profile: {profile_name}")
+
+            # operands to read for each profile
+            op_table = self.read_op_table(profile_offset + self.PROFILE_OPS_OFFSET)
+            out_fname = os.path.join(self._output_directory, profile_name.replace('/', '_'))
+            process_profile(out_fname, self.sb_ops, self.ops_to_reverse, op_table, self.operation_nodes, self._c_output, self._macho)
+
+    def _decompile_normal(self):
+        """
+        Normal i.e. single profile
+        """
+        logger.info(f"Input file is not a bundle.. parsing profile at offset {self.profiles_offset:#x}")
+        op_table_offset = self.profiles_offset
+        op_table = self.read_op_table(op_table_offset)
+
+        # TODO: I dont this this is needed..
+        self.goto(self.operation_nodes_offset)
+        out_fname = os.path.join(self._output_directory, os.path.splitext(os.path.basename(self.data_file.name))[0])
+        process_profile(out_fname, self.sb_ops, self.ops_to_reverse, op_table, self.operation_nodes, self._c_output, self._macho)
 
     def __repr__(self) -> str:
         return f"""
-                struct_size: {hex(self.header_size)}
-                header: {hex(self.type)}
-                op_nodes_count: {hex(self.op_nodes_count)}
-                sb_ops_count: {hex(self.sb_ops_count)}
-                vars_count: {hex(self.vars_count)}
-                states_count: {hex(self.states_count)}
-                num_profiles: {hex(self.num_profiles)}
-                re_table_count: {hex(self.regex_count)}
-                entitlements_count: {hex(self.entitlements_count)}
+            header_size: {self._header_size:#x}
+            profile_type: {self.sandbox_header.profile_type:#x}
+            op_nodes_count: {self.sandbox_header.op_nodes_count:#x}
+            sb_ops_count: {self.sandbox_header.sb_ops_count:#x}
+            vars_count: {self.sandbox_header.vars_count:#x}
+            states_count: {self.sandbox_header.states_count:#x}
+            num_profiles: {self.sandbox_header.num_profiles:#x}
+            re_table_count: {self.sandbox_header.regex_count:#x}
+            entitlements_count: {self.sandbox_header.entitlements_count:#x}
 
-                regex_table_offset: {hex(self.regex_table_offset)}
-                pattern_vars_offset: {hex(self.vars_offset)}
-                states_offset: {hex(self.states_offset)}
-                entitlements_offset: {hex(self.entitlements_offset)}
-                profiles_offset: {hex(self.profiles_offset)}
-                profiles_end_offset: {hex(self.profiles_end_offset)}
-                operation_nodes_offset: {hex(self.operation_nodes_offset)}
-                operation_nodes_size: {hex(self.operation_nodes_size)}
-                base_adrr: {hex(self.base_addr)}
-                """
+            regex_table_offset: {self.regex_table_offset:#x}
+            pattern_vars_offset: {self.vars_offset:#x}
+            states_offset: {self.states_offset:#x}
+            entitlements_offset: {self.entitlements_offset:#x}
+            profiles_offset: {self.profiles_offset:#x}
+            profiles_end_offset: {self.profiles_end_offset:#x}
+            operation_nodes_offset: {self.operation_nodes_offset:#x}
+            operation_nodes_size: {self.operation_nodes_size:#x}
+            base_addr: {self.base_addr:#x}
+            """
+
+
+class SandboxData16_5(SandboxData):
+    """
+    iOS 16.5 sandbox data
+    """
+
+    @property
+    def HEADER_STRUCT(self) -> struct.Struct:
+        return struct.Struct('<HHBBBxHHH')
+
+    @property
+    def HEADER_CLS(self) -> Type[SandboxHeader]:
+        return SandboxHeader16_5
+
+    @property
+    def PROFILE_SIZE(self):
+        """
+        Should evaluate to 0x17e
+        """
+        return (self.sandbox_header.sb_ops_count * INDEX_SIZE) + INDEX_SIZE + INDEX_SIZE  # + name + policy index
+
+    @property
+    def PROFILE_OPS_OFFSET(self):
+        return 4
+
+
+class SandboxData18_0(SandboxData):
+
+    @property
+    def HEADER_STRUCT(self) -> struct.Struct:
+        return struct.Struct('<HHBBBxBxHHH')
+
+    @property
+    def HEADER_CLS(self) -> Type[SandboxHeader]:
+        return SandboxHeader18_0
+
+    @property
+    def PROFILE_SIZE(self) -> int:
+        # TODO: actually understand what are the new fields to each profile..
+        return 0x188
+
+    @property
+    def PROFILE_OPS_OFFSET(self) -> int:
+        return 8
+
+
+RELEASES = {
+    '16.5': SandboxData16_5,
+    '17': SandboxData16_5,
+    '18': SandboxData18_0
+}
+
 
 def node_to_c(node):
     queue = [node]
@@ -130,52 +429,8 @@ def node_to_c(node):
 
     return out.strip()
 
-def parse_profile(infile) -> SandboxData:
-    infile.seek(0)
 
-    # ios 16+
-    header, \
-    op_nodes_count, \
-    sb_ops_count, \
-    vars_count, \
-    states_count, \
-    num_profiles, \
-    re_count, \
-    entitlements_count, \
-    instructions_count \
-        = struct.unpack('<HHBBBxHHHH', infile.read(16))
-
-    sandbox_data = SandboxData(
-        ios16_5_struct.size, header, op_nodes_count, sb_ops_count, vars_count,
-        states_count, num_profiles, re_count, entitlements_count, instructions_count)
-
-    sandbox_data.data_file = infile
-
-    print(sandbox_data)
-
-    return sandbox_data
-
-
-def extract_string_from_offset(f, offset, base_addr) -> str:
-    """Extract string (literal) from given offset."""
-    f.seek(offset * 8 + base_addr)
-    len = struct.unpack("<H", f.read(2))[0] - 1
-    return '%s' % f.read(len).decode("utf-8")
-
-
-def create_operation_nodes(infile, sandbox_data, keep_builtin_filters):
-    # Read sandbox operations.
-    sandbox_data.operation_nodes = operation_node.build_operation_nodes(infile, sandbox_data.op_nodes_count)
-    logger.info("operation nodes")
-
-    for op_node in sandbox_data.operation_nodes:
-        op_node.convert_filter(sandbox_filter.convert_filter_callback, infile, sandbox_data, keep_builtin_filters)
-    logger.info("operation nodes after filter conversion")
-
-
-    return sandbox_data.operation_nodes
-
-def process_profile(infile, outfname, sb_ops, ops_to_reverse, op_table, operation_nodes, c_output, macho):
+def process_profile(outfname, sb_ops, ops_to_reverse, op_table, operation_nodes, c_output, macho):
     if macho:
         c_output = True
     if c_output:
@@ -189,15 +444,14 @@ def process_profile(infile, outfname, sb_ops, ops_to_reverse, op_table, operatio
     if not default_node.terminal:
         return
 
-        
     if c_output:
         outfile.write("extern long allow(const char *);\n")
         outfile.write("extern long deny(const char *);\n")
-        
+
         outfile.write("extern long unparsed_filter();\n")
         outfile.write("extern long subpath();\n")
         outfile.write("extern long subpath_prefix();\n")
-        
+
         for f in Filters.filters.values():
             name = f["name"];
             if name == "":
@@ -207,7 +461,7 @@ def process_profile(infile, outfname, sb_ops, ops_to_reverse, op_table, operatio
     else:
         outfile.write("(version 1)\n")
         outfile.write("(%s default)\n" % (default_node.terminal))
-    
+
     # For each operation expand operation node.
     for idx in range(1, len(op_table)):
         offset = op_table[idx]
@@ -243,187 +497,68 @@ def process_profile(infile, outfname, sb_ops, ops_to_reverse, op_table, operatio
                         outfile.write("(%s %s)\n" % (node.terminal, operation))
 
     outfile.close()
-    
+
     if macho:
         # -O > 0 generates a lot of variable assignments that hinder decompilation readability
         subprocess.run(["clang", outfname.strip() + ".c", "-g", "-O0", "-undefined", "dynamic_lookup", "-Wno-everything", "-o", outfname.strip()])
 
-def display_sandbox_profiles(infile, profiles_offset, num_profiles, base_addr):
-    logger.info("Printing sandbox profiles from bundle")
 
-    names = ""
-    for i in range(0, num_profiles):
+def main(args: argparse.Namespace, sb_ops: list[str]) -> int:
+    sandbox_data = RELEASES[args.release](args, sb_ops)
 
-        infile.seek(profiles_offset + 0x178 * i)
-        name_offset = struct.unpack("<H", infile.read(2))[0]
-        name = extract_string_from_offset(infile, name_offset, base_addr)
+    # Print the sandbox header to the console
+    print(sandbox_data)
 
-        names += "\n" + name
+    if args.print_sandbox_profiles:
+        if sandbox_data.is_profile_bundle():
+            sandbox_data.print_sandbox_profiles()
+        else:
+            logger.error(f"Cannot print sandbox profiles because input file {args.input_file.name} is not a sandbox bundle")
+            return 1
+        return 0
 
-    logger.info("Found %d sandbox profiles." % num_profiles)
+    ###########################
+    # Parse common structures #
+    ###########################
+
+    # Regex, global vars, policies, operation_nodes
+    sandbox_data.parse_common()
+
+    ##############################
+    # Decompile the sandbox data #
+    ##############################
+
+    sandbox_data.decompile()
 
 
-def get_global_vars(f, vars_offset, num_vars, base_address):
-    global_vars = []
-
-    next_var_pointer = vars_offset
-    for i in range(0, num_vars):
-        f.seek(next_var_pointer)
-        var_offset = struct.unpack("<H", f.read(2))[0]
-        f.seek(base_address + (var_offset * 8))
-        len = struct.unpack("H", f.read(2))[0]
-        s = f.read(len-1)
-        global_vars.append(s.decode('utf-8'))
-        next_var_pointer += 2
-
-    logger.info("global variables are {:s}".format(", ".join(s for s in global_vars)))
-    return global_vars
-
-def get_policies(f, offset, count):
-
-    policies = []
-    f.seek(offset)
-    policies = struct.unpack("<%dH" % (count), f.read(2*count))
-    return policies
-
-def read_sandbox_operations(parser, args, sandbox_data) -> None:
-    sb_ops = [l.strip() for l in open(args.operations_file)]
-    sandbox_data.sb_ops = sb_ops
-
-    num_sb_ops = len(sb_ops)
-    logger.info("num_sb_ops: %d", num_sb_ops)
-
-    ops_to_reverse = []
-    if args.operation:
-        for op in args.operation:
-            if op not in sb_ops:
-                parser.print_usage()
-                print ("unavailable operation: {}".format(op))
-                sys.exit(1)
-            ops_to_reverse.append(op)
-        sandbox_data.ops_to_reverse = ops_to_reverse
-
-def parse_regex_list(infile, sandbox_data):
-    logger.debug("\n\nregular expressions:\n")
-    regex_list = []
-
-    if sandbox_data.regex_count > 0:
-        infile.seek(sandbox_data.regex_table_offset)
-        re_offsets_table = struct.unpack("<%dH" % sandbox_data.regex_count, infile.read(2 * sandbox_data.regex_count))
-
-        for offset in re_offsets_table:
-            infile.seek(offset * 8 + sandbox_data.base_addr)
-            re_length = struct.unpack("<H", infile.read(2))[0]
-            re = struct.unpack("<%dB" % re_length, infile.read(re_length))
-            re_debug_str = "re: [", ", ".join([hex(i) for i in re]), "]"
-            logger.debug(re_debug_str)
-            regex_list.append(sandbox_regex.parse_regex(re))
-
-    logger.info(regex_list)
-    sandbox_data.regex_list = regex_list
-
-def main():
-    """Reverse Apple binary sandbox file to SBPL (Sandbox Profile Language) format.
-
-    Sample run:
-        python reverse_sandbox.py -r 7.1.1 container.sb.bin
-        python reverse_sandbox.py -r 7.1.1 -d out container.sb.bin
-        python reverse_sandbox.py -r 7.1.1 -d out container.sb.bin -n network-inbound network-outbound
-        python reverse_sandbox.py -r 9.0.2 -d out sandbox_bundle_iOS_9.0 -n network-inbound network-outbound -p container
-    """
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("filename", help="path to the binary sandbox profile")
-    parser.add_argument("-r", "--release", help="iOS release version for sandbox profile", required=True)
-    parser.add_argument("-o", "--operations_file", help="file with list of operations", required=True)
-    parser.add_argument("-p", "--profile", nargs='+', help="profile to reverse (for bundles) (default is to reverse all operations)")
-    parser.add_argument("-n", "--operation", nargs='+', help="particular operation(s) to reverse (default is to reverse all operations)")
-    parser.add_argument("-d", "--directory", help="directory where to write reversed profiles (default is current directory)")
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(description='Reverse Apple binary sandbox file to SBPL (Sandbox Profile Language) format.')
+    parser.add_argument("input_file", type=argparse.FileType('rb'), help="path to the binary sandbox profile")
+    parser.add_argument("-r", "--release", help="iOS release version for sandbox profile", choices=RELEASES.keys(), required=True)
+    parser.add_argument("-o", "--operations_file", type=argparse.FileType('r'), help="file with list of operations", required=True)
+    parser.add_argument("-p", "--profile", dest='profiles_to_reverse', nargs='+', help="profile to reverse (for bundles) (default is to reverse all operations)")
+    parser.add_argument("-n", "--operation", dest='ops_to_reverse', nargs='+', help="particular operation(s) to reverse (default is to reverse all operations)")
+    # TODO: convert this to pathlib.Path and create directory if it does not already exist..
+    parser.add_argument("-d", "--directory", dest='output_directory', help="directory where to write reversed profiles (default is current directory)")
     parser.add_argument("-psb", "--print_sandbox_profiles", action="store_true", help="print sandbox profiles of a given bundle (only for iOS versions 9+)")
     parser.add_argument("-kbf", "--keep_builtin_filters", help="keep builtin filters in output", action="store_true")
     parser.add_argument("-c", "--c_output", help="output a C file rather than Scheme", action="store_true")
     parser.add_argument("-m", "--macho", help="generate a reversible Mach-O file (implies --c_output)", action="store_true")
-    
+    parser.set_defaults(output_directory=os.getcwd())
 
     args = parser.parse_args()
+    sb_ops = [l.strip() for l in args.operations_file]
+    if not sb_ops:
+        parser.error(f'Operations file {args.operations_file.name} is empty!')
 
-    if args.filename is None:
-        parser.print_usage()
-        print ("no sandbox profile/bundle file to reverse")
-        sys.exit(1)
+    logger.info(f'Read {len(sb_ops)} operations from the operations file')
 
-    if args.directory:
-        out_dir = args.directory
-    else:
-        out_dir = os.getcwd()
+    # Ensure that all user-request ops to reverse are within the set of sb_ops
+    if args.ops_to_reverse and any(op not in sb_ops for op in args.ops_to_reverse):
+        parser.error(f'--operation contains an unavailable operation')
 
-    infile = open(args.filename, "rb")
-
-    sandbox_data = parse_profile(infile)
-
-    read_sandbox_operations(parser, args, sandbox_data)
-
-    parse_regex_list(infile, sandbox_data)
-
-    if args.print_sandbox_profiles:
-        if sandbox_data.type == 0x8000:
-            display_sandbox_profiles(infile, sandbox_data.profiles_offset, sandbox_data.num_profiles, sandbox_data.base_addr)
-        else:
-            print ("cannot print sandbox profiles list; filename {} is not a sandbox bundle".format(args.filename))
-        sys.exit(0)
-
-    ## parse common structure ##
-
-    logger.info("{:d} global vars at offset {}".format(sandbox_data.vars_count, sandbox_data.vars_offset))
-    sandbox_data.global_vars = get_global_vars(infile, sandbox_data.vars_offset, sandbox_data.vars_count, sandbox_data.base_addr)
-    sandbox_data.policies = get_policies(infile, sandbox_data.entitlements_offset, sandbox_data.entitlements_count)
-    # Place file pointer to start of operation nodes area.
-    infile.seek(sandbox_data.operation_nodes_offset)
-    logger.info("number of operation nodes: %u" % sandbox_data.op_nodes_count)
-
-    infile.seek(sandbox_data.operation_nodes_offset)
-    operation_nodes = create_operation_nodes(infile, sandbox_data, args.keep_builtin_filters)
-
-    # In case of sandbox profile bundle, go through each profile.
-    if sandbox_data.type == 0x8000:
-        logger.info("using profile bundle")
-
-        profile_size = (sandbox_data.sb_ops_count * 2) + 2 + 2 # + name + policy index
-
-        # read profiles
-        for i in range(0, sandbox_data.num_profiles):
-            infile.seek(sandbox_data.profiles_offset + profile_size * i)
-            name_offset = struct.unpack("<H", infile.read(2))[0]
-            name = extract_string_from_offset(infile, name_offset, sandbox_data.base_addr)
-
-            # Go past profiles not in list, in case list is defined.
-            if args.profile:
-                if name not in args.profile:
-                    continue
-            logger.info("profile name (offset 0x%x): %s" % (name_offset, name))
-
-            infile.seek(sandbox_data.profiles_offset + profile_size * i + PROFILE_OPS_OFFSET) # name + flags + policy index
-
-            # operands to read for each profile
-            op_table = struct.unpack("<%dH" % sandbox_data.sb_ops_count, infile.read(2 * sandbox_data.sb_ops_count))
-
-            name = name.replace('/', '_')
-            out_fname = os.path.join(out_dir, name)
-            process_profile(infile, out_fname, sandbox_data.sb_ops, sandbox_data.ops_to_reverse, op_table, operation_nodes, args.c_output, args.macho)
-
-    # global profile
-    else:
-        infile.seek(sandbox_data.profiles_offset)
-
-        op_table = struct.unpack("<%dH" % sandbox_data.sb_ops_count, infile.read(2 * sandbox_data.sb_ops_count))
-        infile.seek(sandbox_data.operation_nodes_offset)
-        logger.info("number of operation nodes: %d" % sandbox_data.op_nodes_count)
-
-        out_fname = os.path.join(out_dir, os.path.splitext(os.path.basename(args.filename))[0])
-        process_profile(infile, out_fname, sandbox_data.sb_ops, sandbox_data.ops_to_reverse, op_table, operation_nodes, args.c_output, args.macho)
-
-    infile.close()
+    return args, sb_ops
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(*parse_args()))
