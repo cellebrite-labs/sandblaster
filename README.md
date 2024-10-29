@@ -102,3 +102,15 @@ long file_write_data()
 ## Supported iOS Versions
 
 This fork only supports iOS 16.5 and iOS 17 sandbox format.
+
+## MacOS Support
+
+The `reverse-sandbox/` folder also contains a `sandbox_operations.py` script that can be used to extract the sandbox operations from the sandbox kext of a MacOS Sonoma.
+```s
+python sandbox_operations.py <path_to_sandbox_kext>
+```
+There is also a list of sandbox operations in `sonoma_sandbox_operations.txt`.
+The tool can be used to reverse the sandbox profile of a MacOS Sonoma:
+```
+python3 reverse_sandbox.py -o sandbox_operations.txt sandbox_profile -r 17
+```
