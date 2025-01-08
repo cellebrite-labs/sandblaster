@@ -22,3 +22,4 @@ TAGS
 *.bin
 core
 .DS_STORE
+.idea/
